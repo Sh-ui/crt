@@ -1,0 +1,1166 @@
+#!/usr/bin/env python3
+# clockwork-crt -- global CRT screen filter for the uConsole.
+#
+# Same architecture as clockwork-warmth (see docs/crt-filter.md): a
+# fullscreen click-through ARGB overlay window that mutter (always
+# compositing) alpha-blends over everything. The difference: instead of a
+# solid tint pixel, the window's background is a PIXMAP carrying a
+# pre-rendered CRT pattern (scanlines, phosphor mask, vignette, rounded tube
+# corners). The pixmap lives server-side, so after the one-time render the
+# daemon does zero per-frame work -- it blocks on select(X socket, signal
+# pipe) exactly like the warmth overlay. No polling loops (house rule).
+#
+# Hardware gamma is a no-op on this device (HVS5 gamma block disabled in
+# vc4, raspberrypi/firmware#1274) -- blending is the only lever, which is
+# why this is an overlay and not a LUT.
+#
+# The pattern is rendered in a WARM WORKER CHILD (--render-worker): numpy
+# imports once, each re-render costs ~0.3 s (live-feeling knob panel), and
+# the child exits after 60 s idle so numpy never stays resident.
+#
+# Config: ~/.config/clockwork/display-crt (key=value, fail-soft; validate
+# with `clockwork-crt --check`). clockwork-ensure runs `clockwork-crt
+# --apply` at login to respawn the overlay.
+#
+# Sibling protocol: this overlay and clockwork-warmth both remap themselves
+# on foreign MapNotify to win mutter's map-order compositing. Both set
+# WM_CLASS class "ClockworkOverlay" and IGNORE MapNotify from that class,
+# otherwise the two daemons remap-war forever.
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+CONF = Path.home() / ".config/clockwork/display-crt"
+OVERLAY_PATTERN = "clockwork-crt --overlay"
+OVERLAY_WM_CLASS = "ClockworkOverlay"  # shared with clockwork-warmth
+DOCS = "docs/crt-filter.md"
+
+# ---------------------------------------------------------------- config ---
+
+# Compiled defaults = the "tube" preset with the filter OFF. The panel is
+# 720 logical rows = exactly 3 x 240, so scanline_period=3 gives an
+# integer-scaled 240-line CRT with zero moire.
+DEFAULTS = {
+    "enabled": 0,             # 0/1 -- is the filter on
+    "strength": 100,          # 0..100 master dial on all layer opacities
+    "scanline_period": 3,     # px per scanline cycle (0 or 1 = off; 3 = 240 lines)
+    "scanline_thickness": 1,  # dark px per period (< period)
+    "scanline_opacity": 55,   # 0..100
+    "scanline_softness": 45,  # 0..100 edge feather (0 = crisp 1px)
+    "convergence": 0,         # 0..100 red/blue scanline-edge fringing (CRT gun misconvergence)
+    "glow": 0,                # 0..100 warm glass glow / halation (lifts blacks, the static face of bloom)
+    "mask_type": "none",      # none | grille | grid
+    "mask_period": 3,         # px per mask cycle (>= 2; grille uses 3 stripes)
+    "mask_opacity": 16,       # 0..100 (grille adds haze on dark content -- keep low)
+    "vignette_opacity": 25,   # 0..100 corner darkening (0 = off)
+    "vignette_size": 65,      # 0..100 how far the darkening reaches inward
+    "corner_radius": 12,      # px rounded "tube" corners (0 = off; not scaled by strength)
+}
+INT_KEYS = {k for k in DEFAULTS if k != "mask_type"}
+RANGES = {
+    "enabled": (0, 1),
+    "strength": (0, 100),
+    "scanline_period": (0, 16),
+    "scanline_thickness": (1, 8),
+    "scanline_opacity": (0, 100),
+    "scanline_softness": (0, 100),
+    "convergence": (0, 100),
+    "glow": (0, 100),
+    "mask_period": (2, 16),
+    "mask_opacity": (0, 100),
+    "vignette_opacity": (0, 100),
+    "vignette_size": (0, 100),
+    "corner_radius": (0, 40),
+}
+MASK_TYPES = ("none", "grille", "grid")
+
+PRESETS = {
+    # flagship: integer-scaled 240-line tube
+    "tube": {"strength": 100, "scanline_period": 3, "scanline_thickness": 1,
+             "scanline_opacity": 55, "scanline_softness": 45, "convergence": 0,
+             "glow": 8, "mask_type": "none", "mask_period": 3, "mask_opacity": 16,
+             "vignette_opacity": 25, "vignette_size": 65, "corner_radius": 12},
+    # barely-there texture, minimal brightness cost
+    "subtle": {"strength": 100, "scanline_period": 3, "scanline_thickness": 1,
+               "scanline_opacity": 30, "scanline_softness": 65, "convergence": 0,
+               "glow": 0, "mask_type": "none", "mask_period": 3, "mask_opacity": 0,
+               "vignette_opacity": 12, "vignette_size": 55, "corner_radius": 8},
+    # tube + aperture-grille shimmer (blending approximation; haze on dark bgs)
+    "grille": {"strength": 100, "scanline_period": 3, "scanline_thickness": 1,
+               "scanline_opacity": 50, "scanline_softness": 45, "convergence": 25,
+               "glow": 10, "mask_type": "grille", "mask_period": 3, "mask_opacity": 14,
+               "vignette_opacity": 25, "vignette_size": 65, "corner_radius": 12},
+    # chunky pixel-grid terminal glass
+    "terminal": {"strength": 100, "scanline_period": 4, "scanline_thickness": 1,
+                 "scanline_opacity": 45, "scanline_softness": 25, "convergence": 0,
+                 "glow": 0, "mask_type": "grid", "mask_period": 4, "mask_opacity": 18,
+                 "vignette_opacity": 15, "vignette_size": 55, "corner_radius": 8},
+}
+
+
+def clamp(key: str, val: int) -> int:
+    lo, hi = RANGES[key]
+    return max(lo, min(hi, val))
+
+
+def read_config() -> tuple[dict, list[str]]:
+    """Parse the config file. Fail-soft: every bad key/value keeps the
+    compiled default and adds a warning; a missing file is silently all
+    defaults (flit precedent)."""
+    cfg = dict(DEFAULTS)
+    warnings: list[str] = []
+    if not CONF.is_file():
+        return cfg, warnings
+    for lineno, raw in enumerate(CONF.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"([A-Za-z_]+)\s*=\s*(.*)", line)
+        if not m:
+            warnings.append(f"line {lineno}: not key=value: {raw!r}")
+            continue
+        key, val = m.group(1), m.group(2)
+        val = re.sub(r"\s+#.*$", "", val).strip()  # trailing inline comment
+        if key not in DEFAULTS:
+            warnings.append(f"line {lineno}: unknown key {key!r} (ignored)")
+            continue
+        if key == "mask_type":
+            if val in MASK_TYPES:
+                cfg[key] = val
+            else:
+                warnings.append(f"line {lineno}: mask_type {val!r} not in {MASK_TYPES}, keeping {cfg[key]!r}")
+            continue
+        try:
+            n = int(val)
+        except ValueError:
+            warnings.append(f"line {lineno}: {key} needs an integer, got {val!r}, keeping {cfg[key]}")
+            continue
+        c = clamp(key, n)
+        if c != n:
+            warnings.append(f"line {lineno}: {key}={n} clamped to {c}")
+        cfg[key] = c
+    return cfg, warnings
+
+
+CONF_HEADER = f"""\
+# clockwork-crt -- global CRT screen filter (see {DOCS})
+# Edit freely; bad values keep compiled defaults (check: clockwork-crt --check).
+# Live-apply an edit with: clockwork-crt --apply
+"""
+
+KEY_COMMENTS = {
+    "enabled": "0 off / 1 on",
+    "strength": "0..100 master dial",
+    "scanline_period": "px per line cycle; 3 = integer 240-line scale",
+    "scanline_thickness": "dark px per period",
+    "scanline_opacity": "0..100",
+    "scanline_softness": "0..100 edge feather",
+    "convergence": "0..100 red/blue fringe on scanline edges (chromatic aberration)",
+    "glow": "0..100 warm glass glow -- lifts blacks, softens lines (static bloom)",
+    "mask_type": "none | grille | grid",
+    "mask_period": "px per mask cycle",
+    "mask_opacity": "0..100 (grille: keep low, it hazes dark content)",
+    "vignette_opacity": "0..100",
+    "vignette_size": "0..100 reach toward center",
+    "corner_radius": "px rounded tube corners",
+}
+
+
+def write_config(cfg: dict) -> None:
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    lines = [CONF_HEADER]
+    for key in DEFAULTS:
+        lines.append(f"{key}={cfg[key]}  # {KEY_COMMENTS[key]}")
+    CONF.write_text("\n".join(lines) + "\n")
+
+
+def filter_visible(cfg: dict) -> bool:
+    """Would this config draw anything at all?"""
+    if not cfg["enabled"]:
+        return False
+    scan = cfg["scanline_period"] >= 2 and cfg["scanline_opacity"] > 0
+    mask = cfg["mask_type"] != "none" and cfg["mask_opacity"] > 0
+    vig = cfg["vignette_opacity"] > 0
+    glw = cfg["glow"] > 0
+    if cfg["strength"] == 0:
+        scan = mask = vig = glw = False
+    return scan or mask or vig or glw or cfg["corner_radius"] > 0
+
+
+# ---------------------------------------------------------------- render ---
+
+def render_pattern(cfg: dict, w: int, h: int) -> bytes:
+    """Render the filter layer: w*h premultiplied BGRA bytes (X ZPixmap,
+    depth 32, little-endian). Layers bottom->top over screen content:
+    phosphor mask, scanlines, vignette, corners.
+
+    Every layer except the grille is BLACK, and black-over-black src-over is
+    pure alpha union (commutative: a+b-ab), so the whole stack reduces to
+    broadcastable alpha math with the colored grille folded in below via one
+    closed form (premult rgb = c*a_grille*(1-a_black)) -- ~2-3x faster than
+    generic per-layer RGBA compositing on the CM4, which is what keeps the
+    knob panel's live preview snappy."""
+    try:
+        import numpy as np
+    except ImportError:
+        return _render_fallback(cfg, w, h)
+
+    s = cfg["strength"] / 100.0
+    yy = np.arange(h, dtype=np.float32)[:, None]  # (h,1)
+    xx = np.arange(w, dtype=np.float32)[None, :]  # (1,w)
+
+    def over_a(base, layer):
+        """alpha-only src-over for black layers (commutative union)."""
+        return layer + base * (1.0 - layer)
+
+    # colored underlayers (grille stripes, convergence fringes) accumulate
+    # separately and sit BELOW the black stack via one closed-form pass
+    pm_c = None  # premultiplied rgb, broadcastable (..,3)
+    a_c = None   # its alpha, broadcastable (..)
+
+    def add_colored(pm_new, a_new):
+        """src-over the new colored layer onto the accumulated one."""
+        nonlocal pm_c, a_c
+        if a_c is None:
+            pm_c, a_c = pm_new, a_new
+        else:
+            pm_c = pm_new + pm_c * (1.0 - a_new)[..., None]
+            a_c = a_new + a_c * (1.0 - a_new)
+
+    # ---- the black stack: grid mask, scanlines, vignette, corners ----
+    a_bs = np.zeros((1, 1), np.float32)  # broadcastable accumulator
+    if cfg["mask_type"] == "grid" and cfg["mask_opacity"] > 0 and s > 0:
+        col = ((np.arange(w) % cfg["mask_period"]) == 0).astype(np.float32)[None, :]
+        a_bs = over_a(a_bs, col * (cfg["mask_opacity"] / 100.0) * s)
+    P, T = cfg["scanline_period"], cfg["scanline_thickness"]
+    if P >= 2 and cfg["scanline_opacity"] > 0 and s > 0:
+        T = min(T, P - 1)
+        f = 0.5 + (cfg["scanline_softness"] / 100.0) * (P / 2.0 - 0.5)
+
+        def line_cov(off):
+            d = np.abs((yy + off) % P - (T - 1) / 2.0)
+            d = np.minimum(d, P - d)  # wrap
+            return np.clip((T / 2.0 + f / 2.0 - d) / max(f, 1e-3), 0.0, 1.0)
+
+        cov = line_cov(0.0)
+        a_bs = over_a(a_bs, cov * (cfg["scanline_opacity"] / 100.0) * s)
+        if cfg["convergence"] > 0:
+            # gun-misconvergence fringe: the red/blue "guns" trace the line
+            # shifted +-1px, so line edges pick up red above / blue below --
+            # the chromatic-aberration look a real CRT actually had. Additive
+            # approximation (a static layer cannot displace screen content).
+            sft = cfg["convergence"] / 100.0
+            k = cfg["scanline_opacity"] / 100.0 * s * 0.7
+            ar = np.maximum(line_cov(sft) - cov, 0.0) * k   # (h,1) red rows
+            ab = np.maximum(line_cov(-sft) - cov, 0.0) * k  # (h,1) blue rows
+            pm_f = np.zeros((h, 1, 3), np.float32)
+            pm_f[..., 0] = 255.0 * ar
+            pm_f[..., 2] = 255.0 * ab * (1.0 - ar)
+            add_colored(pm_f, ar + ab * (1.0 - ar))
+    if cfg["vignette_opacity"] > 0 and s > 0:
+        nx = (xx - (w - 1) / 2.0) / ((w - 1) / 2.0)
+        ny = (yy - (h - 1) / 2.0) / ((h - 1) / 2.0)
+        r = np.sqrt(nx * nx + ny * ny)
+        inner = 1.35 - (cfg["vignette_size"] / 100.0) * 0.95
+        t = np.clip((r - inner) / max(1.4142 - inner, 1e-3), 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t)  # smoothstep
+        a_bs = over_a(a_bs, t * (cfg["vignette_opacity"] / 100.0) * s)
+    R = cfg["corner_radius"]
+    if R > 0:  # opaque black, geometry not intensity (no strength scale)
+        cx = np.minimum(xx, (w - 1) - xx)
+        cy = np.minimum(yy, (h - 1) - yy)
+        dc = np.sqrt((R - cx) ** 2 + (R - cy) ** 2)
+        cov = np.clip(dc - R + 0.5, 0.0, 1.0) * ((cx < R) & (cy < R))
+        a_bs = over_a(a_bs, cov.astype(np.float32))
+    a_bs = np.broadcast_to(np.clip(a_bs, 0.0, 1.0), (h, w))
+
+    if cfg["mask_type"] == "grille" and cfg["mask_opacity"] > 0 and s > 0:
+        m = max(3, cfg["mask_period"])
+        stripe = m // 3
+        v = np.arange(w) % m
+        colors = np.zeros((w, 3), np.float32)
+        for i in range(3):  # R,G,B stripes; leftover columns stay black (the gap)
+            colors[(v >= i * stripe) & (v < (i + 1) * stripe), i] = 255.0
+        a_g = np.full((1, w), cfg["mask_opacity"] / 100.0 * s, np.float32)
+        add_colored(colors[None, :, :] * a_g[..., None], a_g)
+
+    if a_c is not None:
+        # colored light surviving the black stack: pm*(1-a_black)
+        keep = 1.0 - a_bs  # (h,w)
+        pm = pm_c * keep[..., None]
+        a_tot = a_bs + a_c * keep
+    else:
+        pm = None
+        a_tot = a_bs
+    ga = cfg["glow"] / 100.0 * 0.15 * s  # capped: 100 = 15% wash
+    if ga > 0.0:
+        # glass glow / halation, the static face of bloom: a faint warm wash
+        # OVER the whole stack -- lifts blacks toward tube-glass grey and
+        # softens the scanlines into their gaps
+        gc = np.array([255.0, 240.0, 218.0], np.float32) * ga  # premult warm white
+        pm = np.broadcast_to(gc, (h, w, 3)) if pm is None else pm * (1.0 - ga) + gc
+        a_tot = ga + a_tot * (1.0 - ga)
+    out = np.zeros((h, w, 4), np.uint8)
+    if pm is not None:
+        out[..., 0] = np.clip(np.round(pm[..., 2]), 0, 255)  # B
+        out[..., 1] = np.clip(np.round(pm[..., 1]), 0, 255)  # G
+        out[..., 2] = np.clip(np.round(pm[..., 0]), 0, 255)  # R
+    out[..., 3] = np.clip(np.round(np.broadcast_to(a_tot, (h, w)) * 255.0), 0, 255)
+    return out.tobytes()
+
+
+def _render_fallback(cfg: dict, w: int, h: int) -> bytes:
+    """No-numpy fallback: separable layers only (scanlines + grid/grille);
+    vignette and corners are skipped with a warning. Slow (~seconds), runs
+    once, keeps the tool alive on a stripped image."""
+    print("clockwork-crt: numpy missing -- fallback render (no vignette/corners)", file=sys.stderr)
+    s = cfg["strength"] / 100.0
+    # per-column straight layer (mask)
+    col = [(0.0, 0.0, 0.0, 0.0)] * w
+    if cfg["mask_type"] == "grid" and cfg["mask_opacity"] > 0:
+        la = cfg["mask_opacity"] / 100.0 * s
+        for x in range(w):
+            if x % cfg["mask_period"] == 0:
+                col[x] = (0.0, 0.0, 0.0, la)
+    elif cfg["mask_type"] == "grille" and cfg["mask_opacity"] > 0:
+        m = max(3, cfg["mask_period"])
+        stripe = m // 3
+        la = cfg["mask_opacity"] / 100.0 * s
+        for x in range(w):
+            v = x % m
+            ch = v // stripe if stripe else 3
+            rgbv = [0.0, 0.0, 0.0]
+            if ch < 3:
+                rgbv[ch] = 255.0
+            col[x] = (rgbv[0], rgbv[1], rgbv[2], la)
+    # per-row alpha (scanlines)
+    P, T = cfg["scanline_period"], min(cfg["scanline_thickness"], max(cfg["scanline_period"] - 1, 1))
+    rowa = [0.0] * h
+    if P >= 2 and cfg["scanline_opacity"] > 0:
+        f = 0.5 + (cfg["scanline_softness"] / 100.0) * (P / 2.0 - 0.5)
+        for y in range(h):
+            u = float(y % P)
+            d = min(abs(u - (T - 1) / 2.0), P - abs(u - (T - 1) / 2.0))
+            cov = max(0.0, min(1.0, (T / 2.0 + f / 2.0 - d) / max(f, 1e-3)))
+            rowa[y] = cov * (cfg["scanline_opacity"] / 100.0) * s
+    out = bytearray(w * h * 4)
+    for y in range(h):
+        ra = rowa[y]
+        base = y * w * 4
+        for x in range(w):
+            cr, cg, cb, ca = col[x]
+            # scanline (black, alpha ra) OVER mask column
+            oa = ra + ca * (1.0 - ra)
+            if oa > 0:
+                mr = (cr * ca * (1.0 - ra)) / oa
+                mg = (cg * ca * (1.0 - ra)) / oa
+                mb = (cb * ca * (1.0 - ra)) / oa
+            else:
+                mr = mg = mb = 0.0
+            i = base + x * 4
+            out[i] = int(mb * oa)
+            out[i + 1] = int(mg * oa)
+            out[i + 2] = int(mr * oa)
+            out[i + 3] = int(oa * 255.0)
+    return bytes(out)
+
+
+class RenderWorker:
+    """Warm render child: numpy imports once, then each re-render costs only
+    the math (~0.3 s on the CM4 vs ~4 s for a cold import) -- what makes the
+    knob panel's live preview feel live. The child blocks on its stdin and
+    exits after 60 s idle (bounded: it dies on its own; the daemon respawns
+    it on demand), so numpy never sits resident between tweak sessions."""
+
+    def __init__(self) -> None:
+        self.proc = None
+
+    def render(self, w: int, h: int) -> bytes | None:
+        for _ in range(2):  # one respawn attempt if the worker idled out
+            if self.proc is None or self.proc.poll() is not None:
+                try:
+                    self.proc = subprocess.Popen(
+                        [sys.executable, os.path.realpath(__file__), "--render-worker"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except OSError as exc:
+                    print(f"clockwork-crt: render worker spawn failed: {exc}", file=sys.stderr)
+                    return None
+            try:
+                self.proc.stdin.write(f"{w}x{h}\n".encode())
+                self.proc.stdin.flush()
+                need = w * h * 4
+                chunks = []
+                while need > 0:
+                    part = self.proc.stdout.read(need)
+                    if not part:
+                        raise OSError("render worker EOF")
+                    chunks.append(part)
+                    need -= len(part)
+                return b"".join(chunks)
+            except (OSError, ValueError):
+                self.proc = None
+        print("clockwork-crt: render worker failed twice", file=sys.stderr)
+        return None
+
+
+def run_render_worker() -> int:
+    import select
+    while True:
+        ready, _, _ = select.select([sys.stdin], [], [], 60.0)
+        if not ready:
+            return 0  # idle: die; the daemon respawns when next needed
+        line = sys.stdin.readline()
+        if not line:
+            return 0  # daemon exited (EOF on the pipe)
+        w, h = (int(v) for v in line.strip().split("x"))
+        cfg, _ = read_config()
+        sys.stdout.buffer.write(render_pattern(cfg, w, h))
+        sys.stdout.buffer.flush()
+
+
+def cmd_render_demo(path: str, spec: str) -> int:
+    """Composite the pattern over a synthetic test screen and write a P6 PPM
+    (no deps) -- the visual half of the validator; works off-device."""
+    w, h = (int(v) for v in spec.split("x"))
+    cfg, warnings = read_config()
+    for msg in warnings:
+        print(f"config: {msg}", file=sys.stderr)
+    data = render_pattern(cfg, w, h)
+    # test screen: color bars top, umbra terminal field with cream block bottom
+    bars = [(248, 242, 233), (237, 75, 64), (196, 118, 35), (191, 152, 0),
+            (67, 160, 71), (25, 135, 232), (150, 104, 230), (126, 126, 126)]
+    out = bytearray()
+    out += f"P6\n{w} {h}\n255\n".encode()
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            if y < h // 2:
+                bg = bars[min(x * len(bars) // w, len(bars) - 1)]
+            elif h // 2 <= y < h * 3 // 4 and w // 8 <= x < w * 7 // 8:
+                bg = (248, 242, 233)
+            else:
+                bg = (31, 30, 29)
+            i = (y * w + x) * 4
+            b, g, r, a = data[i], data[i + 1], data[i + 2], data[i + 3]
+            inv = (255 - a)
+            row += bytes((min(255, r + bg[0] * inv // 255),
+                          min(255, g + bg[1] * inv // 255),
+                          min(255, b + bg[2] * inv // 255)))
+        out += row
+    Path(path).write_bytes(out)
+    print(f"wrote {path} ({w}x{h})")
+    return 0
+
+
+# --------------------------------------------------------------- process ---
+
+def default_x_env() -> None:
+    os.environ.setdefault("DISPLAY", ":0")
+    os.environ.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
+
+
+def overlay_pid() -> int | None:
+    try:
+        out = subprocess.check_output(["pgrep", "-f", OVERLAY_PATTERN], text=True)
+    except subprocess.CalledProcessError:
+        return None
+    pids = [int(p) for p in out.split() if int(p) != os.getpid()]
+    return pids[0] if pids else None
+
+
+def spawn_overlay() -> None:
+    subprocess.Popen(
+        [sys.executable, os.path.realpath(__file__), "--overlay"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def apply_now() -> None:
+    """Make the running overlay match the saved config (spawn/refresh/kill)."""
+    cfg, _ = read_config()
+    pid = overlay_pid()
+    if not filter_visible(cfg):
+        if pid is not None:
+            os.kill(pid, signal.SIGTERM)
+        return
+    if pid is None:
+        spawn_overlay()
+    else:
+        os.kill(pid, signal.SIGUSR1)
+
+
+def cmd_apply(quiet: bool = False) -> int:
+    default_x_env()
+    cfg, warnings = read_config()
+    try:
+        apply_now()
+    except OSError as exc:
+        print(f"clockwork-crt: {exc}", file=sys.stderr)
+        return 1
+    if not quiet:
+        for msg in warnings:
+            print(f"config: {msg}", file=sys.stderr)
+        print(status_line(cfg))
+    return 0
+
+
+def status_line(cfg: dict) -> str:
+    if not filter_visible(cfg):
+        state = "off"
+    else:
+        parts = []
+        if cfg["scanline_period"] >= 2 and cfg["scanline_opacity"] > 0:
+            lines = 720 // cfg["scanline_period"]
+            parts.append(f"{lines}-line scan {cfg['scanline_opacity']}%")
+        if cfg["mask_type"] != "none" and cfg["mask_opacity"] > 0:
+            parts.append(f"{cfg['mask_type']} {cfg['mask_opacity']}%")
+        if cfg["vignette_opacity"] > 0:
+            parts.append(f"vignette {cfg['vignette_opacity']}%")
+        if cfg["corner_radius"] > 0:
+            parts.append(f"corners {cfg['corner_radius']}px")
+        state = "on: " + ", ".join(parts) + f" @ strength {cfg['strength']}"
+    pid = overlay_pid()
+    return f"crt {state} (overlay {'pid %d' % pid if pid else 'not running'})"
+
+
+def cmd_check() -> int:
+    cfg, warnings = read_config()
+    src = "file" if CONF.is_file() else "defaults (no config file)"
+    print(f"config: {CONF} [{src}]")
+    for key in DEFAULTS:
+        mark = " " if cfg[key] == DEFAULTS[key] else "*"
+        print(f"  {mark} {key:<20} = {cfg[key]}")
+    for msg in warnings:
+        print(f"  ! {msg}")
+    import time
+    t0 = time.monotonic()
+    data = render_pattern(cfg, 1280, 720)
+    ms = (time.monotonic() - t0) * 1000
+    print(f"render: 1280x720 ok, {len(data)} bytes, {ms:.0f} ms")
+    print(status_line(cfg))
+    return 1 if warnings else 0
+
+
+def cmd_set(pairs: list[str]) -> int:
+    cfg, _ = read_config()
+    for pair in pairs:
+        if "=" not in pair:
+            print(f"clockwork-crt: --set wants key=value, got {pair!r}", file=sys.stderr)
+            return 1
+        key, val = pair.split("=", 1)
+        key = key.strip()
+        if key not in DEFAULTS:
+            print(f"clockwork-crt: unknown key {key!r} (keys: {', '.join(DEFAULTS)})", file=sys.stderr)
+            return 1
+        if key == "mask_type":
+            if val not in MASK_TYPES:
+                print(f"clockwork-crt: mask_type must be one of {MASK_TYPES}", file=sys.stderr)
+                return 1
+            cfg[key] = val
+        else:
+            try:
+                cfg[key] = clamp(key, int(val))
+            except ValueError:
+                print(f"clockwork-crt: {key} needs an integer, got {val!r}", file=sys.stderr)
+                return 1
+    write_config(cfg)
+    return cmd_apply()
+
+
+def cmd_enable(state: str) -> int:
+    cfg, _ = read_config()
+    cfg["enabled"] = {"on": 1, "off": 0}.get(state, 1 - cfg["enabled"])
+    write_config(cfg)
+    return cmd_apply()
+
+
+def cmd_preset(name: str) -> int:
+    if name not in PRESETS:
+        print(f"clockwork-crt: no preset {name!r} (have: {', '.join(PRESETS)})", file=sys.stderr)
+        return 1
+    cfg, _ = read_config()
+    cfg.update(PRESETS[name])
+    cfg["enabled"] = 1
+    write_config(cfg)
+    return cmd_apply()
+
+
+# ---------------------------------------------------------------- overlay ---
+
+def run_overlay() -> int:
+    """Long-lived fullscreen click-through CRT-pattern window.
+
+    Mirrors clockwork-warmth's overlay: blocks on select(X socket, signal
+    pipe); SIGUSR1 -> re-read config, re-render, swap pixmap; disabled config
+    or SIGTERM -> exit. Remaps itself on foreign MapNotify (mutter composites
+    override-redirect windows in map order) but IGNORES sibling
+    ClockworkOverlay windows -- see header.
+    """
+    default_x_env()
+    try:
+        from Xlib import X, display as xdisplay
+        from Xlib.ext import shape
+    except ImportError:
+        print("clockwork-crt: python3-xlib required (sudo apt install python3-xlib)", file=sys.stderr)
+        return 1
+
+    cfg, _ = read_config()
+    if not filter_visible(cfg):
+        return 0
+
+    # self-pipe + handlers FIRST: SIGUSR1/SIGTERM default-kill, and a poke
+    # can arrive during the slow first render (field-proven 2026-07-12: the
+    # panel's launch-time apply killed a daemon mid-startup). Signals landing
+    # before the loop just queue in the pipe.
+    pipe_r, pipe_w = os.pipe()
+    os.set_blocking(pipe_w, False)
+
+    def on_signal(signum: int, _frame: object) -> None:
+        try:
+            os.write(pipe_w, b"u" if signum == signal.SIGUSR1 else b"t")
+        except BlockingIOError:
+            pass
+
+    signal.signal(signal.SIGUSR1, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    d = xdisplay.Display()
+    screen = d.screen()
+    root = screen.root
+
+    # A compositor must be up or an ARGB window paints opaque. Bounded
+    # one-shot wait to win the login race (mutter starts alongside us).
+    import time
+    cm_atom = d.intern_atom("_NET_WM_CM_S0")
+    for _ in range(60):
+        owner = d.get_selection_owner(cm_atom)
+        if getattr(owner, "id", owner):
+            break
+        time.sleep(0.5)
+    else:
+        print("clockwork-crt: no compositor after 30s, refusing to paint opaque", file=sys.stderr)
+        return 1
+
+    visual_id = None
+    for depth in screen.allowed_depths:
+        if depth.depth == 32:
+            for v in depth.visuals:
+                visual_id = v.visual_id
+                break
+        if visual_id:
+            break
+    if not visual_id:
+        print("clockwork-crt: no 32-bit ARGB visual", file=sys.stderr)
+        return 1
+
+    geo = root.get_geometry()
+    w, h = geo.width, geo.height
+    worker = RenderWorker()
+
+    def make_pixmap():
+        """Render (in the warm worker child) and upload a server-side pixmap."""
+        data = worker.render(w, h)
+        if data is None:
+            return None
+        pix = root.create_pixmap(w, h, 32)
+        gc = pix.create_gc()
+        # band uploads to stay under the X max request size
+        rows = max(1, (128 * 1024) // (w * 4))
+        y = 0
+        while y < h:
+            bh = min(rows, h - y)
+            pix.put_image(gc, 0, y, w, bh, X.ZPixmap, 32, 0,
+                          data[y * w * 4:(y + bh) * w * 4])
+            y += bh
+        gc.free()
+        return pix
+
+    pix = make_pixmap()
+    if pix is None:
+        return 1
+
+    colormap = root.create_colormap(visual_id, X.AllocNone)
+    win = root.create_window(
+        0, 0, w, h, 0, 32, X.InputOutput, visual_id,
+        background_pixmap=pix,
+        border_pixel=0,
+        colormap=colormap,
+        override_redirect=1,
+        event_mask=X.ExposureMask,
+    )
+    win.set_wm_class("clockwork-crt", OVERLAY_WM_CLASS)
+    # empty input shape = clicks/keys pass straight through
+    shape_set = getattr(shape, "SO", None)
+    if shape_set is not None:
+        win.shape_rectangles(shape.SO.Set, shape.SK.Input, 0, 0, 0, [])
+    else:  # older python-xlib constant names
+        win.shape_rectangles(shape.ShapeSet, shape.ShapeInput, 0, 0, 0, [])
+    root.change_attributes(event_mask=X.SubstructureNotifyMask)
+    win.map()
+    win.configure(stack_mode=X.Above)
+    d.flush()
+
+    def is_sibling_overlay(xwin) -> bool:
+        """True for the warmth tint (and any future screen filter) --
+        remapping against a sibling that also remaps would loop forever.
+        Two tells, because a pre-upgrade warmth daemon carries no WM_CLASS
+        (field-proven 2026-07-12: class-only detection remap-warred against
+        the running old warmth): the shared ClockworkOverlay class, or the
+        shape of a screen filter itself -- an override-redirect depth-32
+        window covering the whole root."""
+        try:
+            cls = xwin.get_wm_class()
+            if cls and cls[1] == OVERLAY_WM_CLASS:
+                return True
+            g = xwin.get_geometry()
+            if not (g.depth == 32 and g.x <= 0 and g.y <= 0
+                    and g.width >= w and g.height >= h):
+                return False
+            return bool(xwin.get_attributes().override_redirect)
+        except Exception:
+            return False
+
+    import select
+    import time as _time
+    xfd = d.fileno()
+    # remap rate-limit: defense-in-depth against any OR window that also
+    # remaps on maps -- a storm must degrade to "not on top", never to a
+    # CPU-pinning war (field-proven 2026-07-12)
+    remaps: list[float] = []
+    while True:
+        # signal pipe FIRST, once per event -- an event storm must never
+        # starve SIGTERM (the war also made --off undeliverable)
+        ready, _, _ = select.select([pipe_r], [], [], 0)
+        if ready:
+            msg = os.read(pipe_r, 64)
+            if b"t" in msg:
+                return 0
+            newcfg, _ = read_config()
+            if not filter_visible(newcfg):
+                return 0
+            newpix = make_pixmap()
+            if newpix is not None:
+                win.change_attributes(background_pixmap=newpix)
+                pix.free()
+                pix = newpix
+                win.clear_area(0, 0, 0, 0, 0)
+                d.flush()
+        if d.pending_events():
+            ev = d.next_event()
+            if getattr(ev, "window", None) == win:
+                continue
+            if ev.type == X.MapNotify:
+                if is_sibling_overlay(ev.window):
+                    continue
+                now = _time.monotonic()
+                remaps[:] = [t for t in remaps if now - t < 2.0] + [now]
+                if len(remaps) > 8:
+                    continue  # storm: stop feeding it, stay mapped below
+                win.unmap()
+                win.map()
+                win.configure(stack_mode=X.Above)
+                d.flush()
+            elif ev.type == X.ConfigureNotify:
+                win.configure(stack_mode=X.Above)
+                d.flush()
+            continue
+        select.select([xfd, pipe_r], [], [])
+
+
+# -------------------------------------------------------------------- GUI ---
+
+def load_palette() -> dict:
+    """ombre palette, resolved from the canonical json (never forked); the
+    compiled fallback mirrors config/ombre-palette.json."""
+    fallback = {"umbra": "#1F1E1D", "cream": "#F8F2E9", "orange": "#C47623",
+                "blue": "#1987E8", "slate": "#797B86", "yellow": "#BF9800"}
+    try:
+        vault = Path(os.path.realpath(__file__)).parent.parent.parent
+        data = json.loads((vault / "config/ombre-palette.json").read_text())
+        return {**fallback, **{k: v for k, v in data.items() if isinstance(v, str)}}
+    except (OSError, ValueError):
+        return fallback
+
+
+def read_mode() -> str:
+    """Current desktop color mode from clockwork-mode's state file -- the
+    tui-visual-style sanctioned pattern (clockwork-tag does the same).
+    Resolved at launch, like every launch-adaptive TUI here."""
+    try:
+        m = (Path.home() / ".config/clockwork/color-mode").read_text().strip()
+        return m if m in ("dark", "light") else "dark"
+    except OSError:
+        return "dark"
+
+
+def chrome() -> dict:
+    """Mode-aware faux-TUI chrome (hex table in docs/desktop/tui-visual-style.md).
+    Slate + accents are luma-balanced for both grounds and stay pinned."""
+    pal = load_palette()
+    c = {"slate": pal["slate"], "accent": pal["orange"], "mode": read_mode()}
+    if c["mode"] == "light":
+        c.update(bg=pal["cream"], fg=pal["umbra"],
+                 panel="#EDE5D8", rule="#D9D0C0", sel="#CBC1AF")
+    else:
+        c.update(bg=pal["umbra"], fg=pal["cream"],
+                 panel="#2C2B2A", rule="#3A3937", sel="#4C4D52")
+    return c
+
+
+def light_cost(cfg: dict) -> int:
+    """Rough % of screen light the pattern eats (scanlines + mask; vignette
+    excluded, it only darkens edges) -- the panel's honesty readout."""
+    if not filter_visible(cfg):
+        return 0
+    s = cfg["strength"] / 100.0
+    cost = 0.0
+    P = cfg["scanline_period"]
+    if P >= 2 and cfg["scanline_opacity"] > 0:
+        cost += min(cfg["scanline_thickness"], P - 1) / P * cfg["scanline_opacity"] / 100.0 * s
+    if cfg["mask_type"] == "grid" and cfg["mask_opacity"] > 0:
+        cost += (1 - cost) * (1.0 / max(2, cfg["mask_period"])) * cfg["mask_opacity"] / 100.0 * s
+    elif cfg["mask_type"] == "grille" and cfg["mask_opacity"] > 0:
+        cost += (1 - cost) * (2.0 / 3.0) * cfg["mask_opacity"] / 100.0 * s
+    return round(cost * 100)
+
+
+def detect_preset(cfg: dict) -> str | None:
+    for name, preset in PRESETS.items():
+        if all(cfg[k] == v for k, v in preset.items()):
+            return name
+    return None
+
+
+def run_gui() -> int:
+    """Faux-TUI control panel (house style, [[tui-visual-style]]), centered
+    on open. Keyboard-first: ONE focus bar walks every row -- on/off, preset,
+    each knob -- with Up/Down; Left/Right changes the focused row; Enter or
+    Space activates it. The slate footer hints double as mouse targets (the
+    hint IS the button -- no separate button row). Mouse everywhere too:
+    click focuses/activates, dragging a gauge scrubs it. Ground follows the
+    desktop color mode (read at launch; relaunch after a mode flip). Live
+    preview: every tweak pokes the overlay daemon, whose warm render worker
+    puts it on glass in ~0.4 s."""
+    default_x_env()
+    try:
+        import tkinter as tk
+        import tkinter.font as tkfont
+    except ImportError:
+        print("clockwork-crt: python3-tk required (sudo apt install python3-tk)", file=sys.stderr)
+        return 1
+
+    C = chrome()
+    BG, FG, SLATE = C["bg"], C["fg"], C["slate"]
+    RULE, SEL, ACCENT = C["rule"], C["sel"], C["accent"]
+
+    root = tk.Tk(className="clockwork-crt-gui")
+    root.title("crt-filter")
+    root.resizable(False, False)
+    root.configure(bg=BG, padx=8, pady=8)
+
+    icons = "PiXombre-Icons-Light" if C["mode"] == "light" else "PiXombre-Icons"
+    icon_png = Path.home() / f".local/share/icons/{icons}/48x48/apps/clockwork-crt.png"
+    if icon_png.is_file():
+        try:
+            root.iconphoto(True, tk.PhotoImage(file=str(icon_png)))
+        except tk.TclError:
+            pass
+
+    fam = "SauceCodePro Nerd Font Mono"
+    if fam not in tkfont.families(root):
+        fam = "DejaVu Sans Mono"
+    mono = tkfont.Font(family=fam, size=12)
+    mono_b = tkfont.Font(family=fam, size=12, weight="bold")
+
+    CELLS = 21
+    WIDTH = CELLS + 22  # rule width in chars
+    KNOBS = [
+        ("strength", "strength"),
+        ("scanline_period", "scan period"),
+        ("scanline_thickness", "scan thick"),
+        ("scanline_opacity", "scan dark"),
+        ("scanline_softness", "scan soft"),
+        ("convergence", "chroma ab"),
+        ("glow", "glow"),
+        ("mask_type", "mask"),
+        ("mask_period", "mask period"),
+        ("mask_opacity", "mask dark"),
+        ("vignette_opacity", "vignette"),
+        ("vignette_size", "vig size"),
+        ("corner_radius", "corners"),
+    ]
+    # the focus ring: every interactive row, top to bottom
+    ITEMS = [("toggle", None), ("preset", None)] + [("knob", i) for i in range(len(KNOBS))]
+    cfg, _ = read_config()
+    state = {"focus": 0, "after": None, "preset": detect_preset(cfg)}
+
+    def gauge_text(key: str) -> str:
+        if key == "mask_type":
+            return " ".join(("[%s]" % t if t == cfg[key] else " %s " % t) for t in MASK_TYPES)
+        lo, hi = RANGES[key]
+        frac = (cfg[key] - lo) / max(hi - lo, 1)
+        pos = round(frac * (CELLS - 1))
+        return "├" + "─" * pos + "█" + "─" * (CELLS - 1 - pos) + "┤ %3d" % cfg[key]
+
+    def commit() -> None:
+        state["after"] = None
+        write_config(cfg)
+        try:
+            apply_now()
+        except OSError as exc:
+            status_lbl.config(text=str(exc))
+            return
+        status_lbl.config(text=status_text())
+
+    def schedule_commit() -> None:
+        # debounce config writes while scrubbing (SD-friendly); the daemon's
+        # warm worker turns each poke around fast enough to feel live
+        if state["after"] is not None:
+            root.after_cancel(state["after"])
+        state["after"] = root.after(150, commit)
+
+    def status_text() -> str:
+        pr = state["preset"] or "custom"
+        if not cfg["enabled"]:
+            return f"· off · {pr} ·"
+        parts = [pr]
+        if cfg["scanline_period"] >= 2 and cfg["scanline_opacity"] > 0:
+            parts.append(f"{720 // cfg['scanline_period']} lines")
+        parts.append(f"~{light_cost(cfg)}% light")
+        return "· " + " · ".join(parts) + " ·"
+
+    def refresh() -> None:
+        kind = ITEMS[state["focus"]][0]
+        bar = lambda k: SEL if kind == k else BG  # noqa: E731
+        title_row.config(bg=bar("toggle"))
+        title_lbl.config(bg=bar("toggle"), fg=FG)
+        state_lbl.config(bg=bar("toggle"),
+                         text="● on " if cfg["enabled"] else "○ off",
+                         fg=ACCENT if cfg["enabled"] else SLATE)
+        preset_row.config(bg=bar("preset"))
+        preset_name.config(bg=bar("preset"), fg=FG if kind == "preset" else SLATE)
+        preset_val.config(bg=bar("preset"), fg=FG,
+                          text=f"‹ {state['preset'] or 'custom'} ›")
+        for i, (key, _label) in enumerate(KNOBS):
+            sel = ITEMS[state["focus"]] == ("knob", i)
+            row_lbls[i][0].config(bg=SEL if sel else BG, fg=FG if sel else SLATE)
+            row_lbls[i][1].config(text=gauge_text(key), bg=SEL if sel else BG, fg=FG)
+        status_lbl.config(text=status_text())
+
+    def toggle() -> None:
+        cfg["enabled"] = 1 - cfg["enabled"]
+        refresh()
+        schedule_commit()
+
+    def apply_preset(name: str) -> None:
+        cfg.update(PRESETS[name])
+        cfg["enabled"] = 1
+        state["preset"] = name
+        refresh()
+        schedule_commit()
+
+    def cycle_preset(delta: int = 1) -> None:
+        names = list(PRESETS)
+        cur = names.index(state["preset"]) if state["preset"] in names else -delta
+        apply_preset(names[(cur + delta) % len(names)])
+
+    def adjust_knob(i: int, delta: int) -> None:
+        key = KNOBS[i][0]
+        if key == "mask_type":
+            cfg[key] = MASK_TYPES[(MASK_TYPES.index(cfg[key]) + delta) % len(MASK_TYPES)]
+        else:
+            lo, hi = RANGES[key]
+            step = max(1, (hi - lo) // 20)
+            cfg[key] = clamp(key, cfg[key] + delta * step)
+        state["preset"] = detect_preset(cfg)
+        refresh()
+        schedule_commit()
+
+    def move(delta: int) -> None:
+        state["focus"] = (state["focus"] + delta) % len(ITEMS)
+        refresh()
+
+    def change(delta: int) -> None:
+        kind, i = ITEMS[state["focus"]]
+        if kind == "toggle":
+            toggle()
+        elif kind == "preset":
+            cycle_preset(delta)
+        else:
+            adjust_knob(i, delta)
+
+    def activate() -> None:
+        kind, i = ITEMS[state["focus"]]
+        if kind == "toggle":
+            toggle()
+        elif kind == "preset":
+            cycle_preset(1)
+        elif KNOBS[i][0] == "mask_type":
+            adjust_knob(i, 1)
+
+    def focus_click(idx: int, act) -> None:
+        state["focus"] = idx
+        act()
+
+    panel = tk.Frame(root, bg=BG, padx=16, pady=12,
+                     highlightbackground=RULE, highlightcolor=RULE, highlightthickness=1)
+    panel.pack()
+
+    # focus row 0 -- the title row IS the on/off toggle
+    title_row = tk.Frame(panel, bg=BG, cursor="hand2")
+    title_row.pack(fill="x")
+    title_lbl = tk.Label(title_row, text="crt filter", font=mono_b, bg=BG, fg=FG, cursor="hand2")
+    title_lbl.pack(side="left")
+    state_lbl = tk.Label(title_row, text="", font=mono_b, bg=BG, fg=SLATE, cursor="hand2")
+    state_lbl.pack(side="right")
+    for wdg in (title_row, title_lbl, state_lbl):
+        wdg.bind("<Button-1>", lambda _e: focus_click(0, toggle))
+    tk.Label(panel, text="─" * WIDTH, font=mono, bg=BG, fg=RULE).pack(pady=(2, 2))
+
+    # focus row 1 -- preset selector (Left/Right or click cycles)
+    preset_row = tk.Frame(panel, bg=BG, cursor="hand2")
+    preset_row.pack(fill="x")
+    preset_name = tk.Label(preset_row, text=f"{'preset':<12}", font=mono, bg=BG, fg=SLATE, cursor="hand2")
+    preset_name.pack(side="left")
+    preset_val = tk.Label(preset_row, text="", font=mono, bg=BG, fg=FG, cursor="hand2")
+    preset_val.pack(side="left")
+    for wdg in (preset_row, preset_name, preset_val):
+        wdg.bind("<Button-1>", lambda _e: focus_click(1, lambda: cycle_preset(1)))
+    tk.Label(panel, text="─" * WIDTH, font=mono, bg=BG, fg=RULE).pack(pady=(2, 2))
+
+    # focus rows 2+ -- the knobs
+    row_lbls = []
+    for i, (key, label) in enumerate(KNOBS):
+        row = tk.Frame(panel, bg=BG)
+        row.pack(anchor="w", fill="x")
+        name = tk.Label(row, text=f"{label:<12}", font=mono, bg=BG, fg=SLATE)
+        name.pack(side="left")
+        gauge = tk.Label(row, text="", font=mono, bg=BG, fg=FG,
+                         cursor="sb_h_double_arrow")
+        gauge.pack(side="left", fill="x", expand=True, anchor="w")
+        row_lbls.append((name, gauge))
+
+        def on_click(_e, idx=i):
+            state["focus"] = 2 + idx
+            refresh()
+
+        def on_drag(e, idx=i, kk=key):
+            state["focus"] = 2 + idx
+            if kk == "mask_type":
+                adjust_knob(idx, 1)
+                return
+            cell_w = mono.measure("─")
+            frac = max(0.0, min(1.0, (e.x / max(1, cell_w) - 1) / (CELLS - 1)))
+            lo, hi = RANGES[kk]
+            cfg[kk] = clamp(kk, round(lo + frac * (hi - lo)))
+            state["preset"] = detect_preset(cfg)
+            refresh()
+            schedule_commit()
+
+        name.bind("<Button-1>", on_click)
+        gauge.bind("<Button-1>", on_drag)
+        gauge.bind("<B1-Motion>", on_drag)
+
+    tk.Label(panel, text="─" * WIDTH, font=mono, bg=BG, fg=RULE).pack(pady=(2, 0))
+    status_lbl = tk.Label(panel, text="", font=mono, bg=BG, fg=SLATE)
+    status_lbl.pack(pady=(2, 0))
+
+    # slate footer: the key hints ARE the buttons (clickable visual flags)
+    footer = tk.Frame(panel, bg=BG)
+    footer.pack(pady=(2, 2))
+    HINTS = [("↑↓ move", None), ("←→ change", None), ("↵ set", activate),
+             ("o on/off", toggle), ("p preset", lambda: cycle_preset(1)),
+             ("q quit", root.destroy)]
+    for text, cmd in HINTS:
+        lbl = tk.Label(footer, text=text, font=mono, bg=BG, fg=SLATE,
+                       cursor="hand2" if cmd else "arrow")
+        lbl.pack(side="left", padx=5)
+        if cmd:
+            lbl.bind("<Button-1>", lambda _e, c=cmd: c())
+            lbl.bind("<Enter>", lambda _e, l=lbl: l.config(fg=FG))
+            lbl.bind("<Leave>", lambda _e, l=lbl: l.config(fg=SLATE))
+
+    root.bind("<Up>", lambda _e: move(-1))
+    root.bind("<Down>", lambda _e: move(1))
+    root.bind("<Left>", lambda _e: change(-1))
+    root.bind("<Right>", lambda _e: change(1))
+    root.bind("<Return>", lambda _e: activate())
+    root.bind("<space>", lambda _e: activate())
+    root.bind("o", lambda _e: toggle())
+    root.bind("p", lambda _e: cycle_preset(1))
+    root.bind("q", lambda _e: root.destroy())
+    root.bind("<Escape>", lambda _e: root.destroy())
+
+    refresh()
+    # center on the screen (mutter won't place an exact-center for us)
+    root.update_idletasks()
+    rw, rh = root.winfo_reqwidth(), root.winfo_reqheight()
+    root.geometry(f"+{max(0, (root.winfo_screenwidth() - rw) // 2)}"
+                  f"+{max(0, (root.winfo_screenheight() - rh) // 2)}")
+    try:
+        apply_now()
+    except OSError as exc:
+        status_lbl.config(text=str(exc))
+    root.mainloop()
+    return 0
+
+
+# ------------------------------------------------------------------- main ---
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="uConsole global CRT screen filter (software overlay)")
+    parser.add_argument("--apply", action="store_true", help="apply saved config (login hook)")
+    parser.add_argument("--on", action="store_true", help="enable the filter")
+    parser.add_argument("--off", action="store_true", help="disable the filter")
+    parser.add_argument("--toggle", action="store_true", help="flip the filter")
+    parser.add_argument("--set", nargs="+", metavar="K=V", dest="set_pairs", help="set config keys and apply")
+    parser.add_argument("--preset", metavar="NAME", help="load a preset and enable (%s)" % ", ".join(PRESETS))
+    parser.add_argument("--check", action="store_true", help="validate config + time a render")
+    parser.add_argument("--status", action="store_true", help="one-line state")
+    parser.add_argument("--overlay", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--render-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--render-demo", nargs="+", metavar=("FILE", "WxH"), help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.overlay:
+        return run_overlay()
+    if args.render_worker:
+        return run_render_worker()
+    if args.render_demo:
+        spec = args.render_demo[1] if len(args.render_demo) > 1 else "1280x720"
+        return cmd_render_demo(args.render_demo[0], spec)
+    if args.check:
+        return cmd_check()
+    if args.status:
+        print(status_line(read_config()[0]))
+        return 0
+    if args.apply:
+        return cmd_apply(quiet=True)
+    if args.on:
+        return cmd_enable("on")
+    if args.off:
+        return cmd_enable("off")
+    if args.toggle:
+        return cmd_enable("toggle")
+    if args.preset:
+        return cmd_preset(args.preset)
+    if args.set_pairs:
+        return cmd_set(args.set_pairs)
+    return run_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

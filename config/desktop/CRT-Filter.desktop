@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=CRT
+GenericName=Screen filter
+Comment=Global CRT screen filter (scanlines, phosphor mask, vignette; software overlay)
+Icon=clockwork-crt
+Exec=clockwork-crt
+Terminal=false
+Categories=Settings;Utility;
+StartupNotify=true
+StartupWMClass=clockwork-crt-gui
