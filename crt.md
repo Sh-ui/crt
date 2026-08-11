@@ -9,7 +9,7 @@ after that the daemon does no per-frame work at all.
 - **kind:** [[app]]
 - **runs-on:** the uConsole Pi. Authored on the Mac, deployed to the Pi.
 - **repo:** `Sh-ui/crt`, cloned at `~/vault/dev/crt`.
-- **reference:** [[crt-filter]] -- architecture, the panel geometry math, the knobs, and what
+- **reference:** [[docs/crt-filter|crt-filter]] -- architecture, the panel geometry math, the knobs, and what
   a static layer cannot do.
 
 Extracted from [[clockwork-lab]] as the dissolution pilot, the first app to leave the

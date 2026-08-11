@@ -8,7 +8,7 @@ The pattern is rendered ONCE per config change (numpy, in a warm `--render-worke
 
 ## Fit to this exact panel
 
-720 landscape rows = exactly 3 x 240, so `scanline_period=3` is an integer-scaled 240-line CRT: no moire (the classic crt-pi shader failure at non-integer scales), and a 3 px period at this panel's ~294 PPI is ~20 cycles/degree at 30 cm -- the same angular line pitch as a real desktop CRT. The panel's RGB stripe runs along its native-portrait short axis, which lands VERTICALLY through each landscape pixel, so a landscape aperture grille cannot align with hardware subpixels: `mask_type=grille` is a whole-pixel approximation (translucent primary stripes) that hazes dark content, and defaults off. Panel facts live in [[reference-clockwork-pi]]; research sources in [[references]].
+720 landscape rows = exactly 3 x 240, so `scanline_period=3` is an integer-scaled 240-line CRT: no moire (the classic crt-pi shader failure at non-integer scales), and a 3 px period at this panel's ~294 PPI is ~20 cycles/degree at 30 cm -- the same angular line pitch as a real desktop CRT. The panel's RGB stripe runs along its native-portrait short axis, which lands VERTICALLY through each landscape pixel, so a landscape aperture grille cannot align with hardware subpixels: `mask_type=grille` is a whole-pixel approximation (translucent primary stripes) that hazes dark content, and defaults off. Panel facts live in [[reference-clockwork-pi]]; research sources in [[meta/references|references]].
 
 ## Config port
 
@@ -42,16 +42,12 @@ What a static layer CANNOT do: content-driven bloom, true chromatic aberration, 
 
 mutter composites override-redirect windows in map order ([[handoff-display-warmth]]), so each persistent overlay remaps itself on foreign MapNotify to stay on top -- and two such daemons would remap-war forever ([[lessons]]). Siblings are detected two ways, because a pre-upgrade daemon carries no class: the shared WM_CLASS class `ClockworkOverlay`, or the shape of a screen filter itself (override-redirect, depth 32, covering the root). Both daemons also check their signal pipe once per event (an event storm must never starve SIGTERM), rate-limit remaps to 8 per 2 s so any future storm degrades to "not on top" instead of a war, and install their signal handlers BEFORE the slow startup work (a launch-time poke used to hit the default action and kill a daemon mid-first-render). Relative order between the two filters is last-mapped-wins, which is visually immaterial: a uniform low-alpha tint and a dark pattern near-commute under src-over.
 
-Durability rests on three symlinks and one login hook: `/usr/local/bin/clockwork-crt` and `~/.local/share/applications/CRT-Filter.desktop` both point back into `~/vault/dev/crt`, the tube-TV icon is rendered into both PiXombre sets, and `clockwork-ensure` runs `clockwork-crt --apply` at login so the overlay respawns with whatever `~/.config/clockwork/display-crt` holds. Render engine, overlay daemon, and control panel were exercised live on-device 2026-07-12/13 -- tube preset in `cw shot`, clean `--off` exit, no war against the old warmth daemon, panel driven by the user with settings persisting to config -- and the filter came up on every reboot while it deployed from the clockwork-lab clone (confirmed by the user, last checked 2026-07-22). Deployment from this repo's path is applied, reboot-persistence UNVERIFIED.
+Durability rests on three symlinks and one login hook: `/usr/local/bin/clockwork-crt` and `~/.local/share/applications/CRT-Filter.desktop` point at this repo's clone, the tube-TV icon is rendered into both PiXombre sets, and `clockwork-ensure` runs `clockwork-crt --apply` at login so the overlay respawns with whatever `~/.config/clockwork/display-crt` holds. **On the Pi today those symlinks still point into the clockwork-lab clone: deployment from this repo is applied on the Mac side only, reboot-persistence UNVERIFIED, blocked on the device being offline since 2026-08-06.** What is proven is the filter itself -- render engine, overlay daemon, and control panel were exercised live on-device 2026-07-12/13 (tube preset in `cw shot`, clean `--off` exit, no war against the old warmth daemon, panel driven by the user with settings persisting to config) and it came up on every reboot from the old path, confirmed by the user, last checked 2026-07-22.
 
 ## Open threads
 
-- T71
+- T71 -- real CRT shader pass (bloom / chromatic aberration / curvature), tracked in [[tasks]] while the monorepo still holds the task hub.
 
 ## Linked from
 
-- [[handoff-display-warmth]]
-- [[index]]
-- [[lessons]]
-- [[references]]
-- [[tasks]]
+The pages that link here live in [[clockwork-lab]], and their `[[crt-filter]]` links land on that repo's moved-out pointer rather than this page: [[handoff-display-warmth]], [[lessons]], [[meta/references|references]], [[reference-clockwork-pi]], [[tui-visual-style]], and the docs index. Two pages of the same basename is the cost of keeping those links resolvable; the pointer names this page by path.
