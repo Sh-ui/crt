@@ -10,9 +10,8 @@ symlinks back into this clone -- **edit here, never the deployed copy**.
 
 ## Reaching the Pi
 
-Use the `cw` CLI: `cw sh` / `x` /
-`shot`. Never `raspberrypi.local`, never a LAN IP. If the Pi does not answer it is
-genuinely offline -- report it, do not chase addresses.
+Use the `cw` CLI: `cw sh` / `x` / `shot`. Never `raspberrypi.local`, never a LAN IP.
+If the Pi does not answer it is genuinely offline -- report it, do not chase addresses.
 
 ## The bar
 
